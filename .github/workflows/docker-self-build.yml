@@ -1,0 +1,215 @@
+# 9Router 自建镜像 —— 每天自动同步上游最新代码并构建
+#
+# 用法：
+#  1. Fork https://github.com/decolua/9router（保持 public）
+#  2. 把本文件放到你 fork 的 .github/workflows/docker-self-build.yml（默认分支 master）
+#  3. 把下面 env.DOCKERHUB_IMAGE 改成你自己的：你的DockerHub用户名/9router
+#  4. 在 fork 的 Settings → Secrets and variables → Actions 里添加：
+#       DOCKERHUB_USERNAME（你的 Docker Hub 用户名）
+#       DOCKERHUB_TOKEN（Docker Hub → Account Settings → Security → New Access Token，权限 Read & Write）
+#     可选加两个变量加速国内构建（Actions → Variables）：
+#       ALPINE_MIRROR=mirrors.aliyun.com
+#       NPM_REGISTRY=https://registry.npmmirror.com/
+#  5. 去 Actions 页手动 Run workflow 跑一次验证，之后每天北京时间 10 点自动构建
+#
+# 原理：不再等作者打 tag，而是直接构建上游 master 最新 commit；
+#       amd64/arm64 在 GitHub 原生 runner 上分别构建（照抄官方流程），经 /api/health
+#       烟雾测试后合并成多架构 manifest，同时推到 GHCR 和你自己的 Docker Hub，
+#       latest 永远指向最新构建 —— 这就是你要的"实时"。
+
+name: 9Router 自建镜像（每日构建）
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # 每天 10:00（北京时间）自动构建
+  workflow_dispatch:       # 手动立即构建一次
+
+concurrency:
+  group: self-build-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  # ↓↓↓↓↓↓ 改成你自己的 Docker Hub 仓库，例如：ghostboss/9router ↓↓↓↓↓↓
+  DOCKERHUB_IMAGE: czpghost/9router
+
+jobs:
+  prepare:
+    name: 拉取上游最新代码
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha_short: ${{ steps.meta.outputs.sha_short }}
+      ghcr_image: ${{ steps.meta.outputs.ghcr_image }}
+    steps:
+      - name: Checkout 上游 master
+        uses: actions/checkout@v4
+        with:
+          repository: decolua/9router
+          ref: master
+          fetch-depth: 1
+
+      - name: 读取版本信息
+        id: meta
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          SHA=$(git rev-parse --short HEAD)
+          GHCR="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "version=$VERSION"
+            echo "sha_short=$SHA"
+            echo "ghcr_image=$GHCR"
+          } >> "$GITHUB_OUTPUT"
+          echo "本次构建上游版本: $VERSION @ $SHA"
+
+  build:
+    name: 构建 ${{ matrix.platform }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            suffix: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            suffix: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      GHCR_IMAGE: ${{ needs.prepare.outputs.ghcr_image }}
+    steps:
+      - name: Checkout 上游 master
+        uses: actions/checkout@v4
+        with:
+          repository: decolua/9router
+          ref: master
+          fetch-depth: 1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并按 digest 推送
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            APP_VERSION=${{ needs.prepare.outputs.version }}
+            ALPINE_MIRROR=${{ vars.ALPINE_MIRROR || 'mirrors.aliyun.com' }}
+            NPM_REGISTRY=${{ vars.NPM_REGISTRY || 'https://registry.npmmirror.com/' }}
+          cache-from: type=gha,scope=selfbuild-${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=selfbuild-${{ matrix.suffix }}
+          provenance: false
+          sbom: false
+
+      - name: 烟雾测试 /api/health
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          c="9router-smoke-${GITHUB_RUN_ID}-${{ matrix.suffix }}"
+          trap 'docker rm -f "$c" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "$c" --platform "$PLATFORM" \
+            -p 20128:20128 "${{ env.GHCR_IMAGE }}@${IMAGE_DIGEST}"
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:20128/api/health >/dev/null; then
+              echo "✅ ${PLATFORM} 健康检查通过"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "❌ ${PLATFORM} 健康检查失败，容器日志："
+          docker logs "$c" || true
+          exit 1
+
+      - name: 保存 digest
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s\n' "${{ steps.build.outputs.digest }}" > "$RUNNER_TEMP/digests/${{ matrix.suffix }}.txt"
+
+      - name: 上传 digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.suffix }}
+          path: ${{ runner.temp }}/digests/${{ matrix.suffix }}.txt
+          if-no-files-found: error
+
+  publish:
+    name: 合并多架构镜像并发布
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GHCR_IMAGE: ${{ needs.prepare.outputs.ghcr_image }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SHA_SHORT: ${{ needs.prepare.outputs.sha_short }}
+    steps:
+      - name: 下载 digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 登录 Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 组装多架构 manifest 并打 tag 推送
+        run: |
+          set -euo pipefail
+          TAG="${VERSION}-${SHA_SHORT}"
+          srcs=()
+          for f in "$RUNNER_TEMP"/digests/*.txt; do
+            d="$(tr -d '\n' < "$f")"
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]]
+            srcs+=("${GHCR_IMAGE}@${d}")
+          done
+          [ "${#srcs[@]}" -eq 2 ]
+          docker buildx imagetools create \
+            --tag "${GHCR_IMAGE}:${TAG}" \
+            --tag "${GHCR_IMAGE}:latest" \
+            --tag "${{ env.DOCKERHUB_IMAGE }}:${TAG}" \
+            --tag "${{ env.DOCKERHUB_IMAGE }}:latest" \
+            "${srcs[@]}"
+          echo "已发布:"
+          echo "  ${{ env.DOCKERHUB_IMAGE }}:${TAG}"
+          echo "  ${{ env.DOCKERHUB_IMAGE }}:latest"
+
+      - name: 校验多架构 manifest
+        run: |
+          docker buildx imagetools inspect --raw "${{ env.DOCKERHUB_IMAGE }}:latest" | \
+            grep -o '"architecture":"[^"]*"' | sort -u
